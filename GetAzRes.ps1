@@ -477,8 +477,8 @@ try {
 }
 finally { 
 # Close Excel file if Ctrl+C entered
-    Close $global:exPkg 
+    ExcelClose $global:exPkg 
 }
 
 # Close Excel file
-Close $global:exPkg
+ExcelClose $global:exPkg
