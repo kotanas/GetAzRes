@@ -7,6 +7,7 @@ param (
 [switch]$IPs, 
 [switch]$Storages,
 [switch]$VMs, 
+[switch]$SQL,
 [switch]$Usage, 
 [switch]$Cost,
 [switch]$Continue,
@@ -19,15 +20,24 @@ $global:Interval = [TimeSpan]"00:15:00"
 $titleDisks = @("Subscription","Disk Name", "Location", "Size", "Tier")
 $titleIPs = @("Subscription","Name", "Type", "Tier", "Interface")
 $titleStorages = @("Subscription", "Name", "Location", "Size", "Tier")
-$titleVMs = @("Subscription", "Name", "Size", "Location", "Auto Shutdown")
-$titleVMsUsage = @("CPU 80%-100%", "CPU 0%-10%", "RAM 80%-100%", "RAM 0%-20%")
+$titleVMs = @("Subscription", "Name", "Size", "Location", "OS", "Auto Shutdown")
+$titleVMsUsage = @("CPU 80%-100%", "CPU 0%-20%", "RAM 80%-100%", "RAM 0%-20%")
 $titleCost = "Cost (last 30 days)"
-$logFile = ".\GetRes.tmp"
+$logFile = ".\GetAzRes.tmp"
 
 . .\xlsx.ps1
 
 # Suppress warnings
 $WarningPreference = "SilentlyContinue"
+
+# Check parameters are consistent
+function CheckParams() {
+# For VMs
+    if (-not $VMs -and $SQL) {
+        Write-Host 'The "-SQL" option makes sense only if "-VMs" option is specified'
+        Exit
+    }
+}
 
 # Log file for being able to continue if interrupted
 $global:log = $null
@@ -85,16 +95,21 @@ function TitleAdd([ref][string[]]$title, [string[]]$titleAdd) {
 
 function GetPercentageBetween($arr, $min, $max, $property) {
     $n = 0
+    $invalid = 0
 
     for ($i = 0; $i -lt $arr.Count; $i++)  {
         $obj = $arr[$i]
         if ($obj.$property -ne $Null) {
-            if ($obj.$property -ge $min -and $obj.$property -le $max) { $n = $n + 1 }
+            if ($obj.$property -ge $min -and $obj.$property -le $max) { 
+                $n += 1 }
+        }
+        else {
+            $invalid += 1
         }
     }
 
     if ($n -gt 0) {
-        return [math]::Round(($n / $arr.Count) * 100, 2)
+        return [math]::Round(($n / ($arr.Count - $invalid)) * 100, 2)
     }
 
     return 0
@@ -122,13 +137,12 @@ function GetLocation($location) {
     return $loc.DisplayName
 }
 
-function AddRawToExcel($wb, $out) {
+function AddRawToExcel($ws, $out) {
+    ExcelAdd-WorkSheetRaw $ws $out
+
     if ($Top -gt 0) {
-        if ($global:top -gt 0) {
-            ExcelAdd-WorkSheetRaw $wb $out
-            $global:top -= 1
-        }
-        else {
+        $global:top -= 1
+        if ($global:top -le 0) {
             $global:top = $Top
             return $false
         }
@@ -209,7 +223,7 @@ function UnattachedDisks() {
     Write-Host "`nProcessing unattached disks..."
 
     foreach ($subs in $global:listSubscriptions) {
-        Write-Host "Subscription $subs"
+        Write-Host "Subscription $($subs.Name)"
         $Null = Set-AzContext -Subscription $subs
 
         $listDisks = (Get-AzDisk | where DiskState -eq "Unattached")
@@ -217,6 +231,11 @@ function UnattachedDisks() {
             $disk = $listDisks[$i]
 
             Write-Host "`rDisks remaining: $($listDisks.Count - $i) " $disk.Name "                            " -NoNewLine
+
+            # Check if this is ASR replica disk
+            if ($disk.Name.EndsWith("-ASRReplica") -or $disk.Name.StartsWith("asr")) {
+                continue
+            }
 
             # Check if continue after interruption
             if (CheckLog $disk.Id) {
@@ -263,6 +282,7 @@ function StorageAccounts() {
     Write-Host "`nProcessing Storage accounts..."
 
     foreach ($subs in $global:listSubscriptions) {
+        Write-Host "Subscription $($subs.Name)"
         $Null = Set-AzContext -Subscription $subs
     
         $listStorages = Get-AzStorageAccount
@@ -314,6 +334,7 @@ function VMs() {
 
     $workSheet = ExcelAdd-WorkSheet $global:exPkg $global:workBook "VMs"
     if (-not $Continue) {
+        if ($SQL)   { TitleAdd ([ref]$titleVMs) "SQL Agent" }
         if ($Usage) { TitleAdd ([ref]$titleVMs) $titleVMsUsage }
         if ($Cost)  { TitleAdd ([ref]$titleVMs) $titleCost }
         ExcelAdd-WorkSheetRaw $workSheet $titleVMs
@@ -322,12 +343,14 @@ function VMs() {
     Write-Host "`nProcessing VMs ..."
 
     foreach ($subs in $global:listSubscriptions) {
+        Write-Host "Subscription $($subs.Name)"
         $Null = Set-AzContext -Subscription $subs
 
         $listVMs = Get-AzVM
-        for ($i = 0; $i -lt $listVMs.Count; $i++) {
+        $n = $listVMs.Count
+        for ($i = 0; $i -lt $n; $i++) {
             $vm = $listVMs[$i]
-            Write-Host "`rVMs remaining: $($listVMs.Count - $i) " $vm.Name "                            " -NoNewLine
+            Write-Host "`r  $subs - VM ($($i+1)/$n): " $vm.Name "                            " -NoNewLine
 
             # Check if continue after interruption
             if (CheckLog $vm.Id) {
@@ -343,7 +366,25 @@ function VMs() {
                 $autostop = $schedule.Properties.dailyRecurrence.time.Insert(2, ":")
             }
 
-            $out = $subs.Name, $vm.Name, $size, (GetLocation $vm.Location), $autostop
+            $out = $subs.Name, $vm.Name, $size, (GetLocation $vm.Location), $vm.StorageProfile.OsDisk.OsType, $autostop
+
+            # Check if SQL agent is installed
+            $isSQL = "No" 
+            if ($SQL) {
+                if ($vm.StorageProfile.OsDisk.OsType -eq "Windows") {
+                    try  {
+                        if ((Get-AzVMExtension -ResourceId $vm.Id).Name -contains "SqlIaasExtension") { 
+                            $isSQL = "Yes" 
+                        }
+                    }
+                    catch { }
+                }
+                else {
+                    $isSQL = ""
+                }
+
+                $out += $isSQL
+            }
 
             # Get RAM usage (avg / max), %
             if ($Usage) {
@@ -386,7 +427,6 @@ function VMs() {
             }
             UpdateLog $vm.Id
         }
-        Write-Host ""
     }
 }
 
@@ -401,6 +441,7 @@ function UnattachedIPs() {
     Write-Host "`nProcessing IP addresses..."
 
     foreach ($subs in $global:listSubscriptions) {
+        Write-Host "Subscription $($subs.Name)"
         $Null = Set-AzContext -Subscription $subs
 
         # Find all IPs without IP configuration associated with it
