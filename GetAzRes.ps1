@@ -24,6 +24,7 @@ $titleVMs = @("Subscription", "Name", "Size", "Location", "OS", "Auto Shutdown")
 $titleVMsUsage = @("CPU 80%-100%", "CPU 0%-20%", "RAM 80%-100%", "RAM 0%-20%")
 $titleCost = "Cost (last 30 days)"
 $logFile = ".\GetAzRes.tmp"
+$listModules = @("Az.Billing", "Az.Accounts", "Az.Compute", "Az.Network", "Az.Resources")
 
 . .\xlsx.ps1
 
@@ -151,11 +152,37 @@ function AddRawToExcel($ws, $out) {
     return $true
 }
 
+# Check if all required modules are installed
+function CheckModulesInstalled() {
+    $ok = $true
+
+    foreach ($module in $listModules) {
+        if (-not (Get-Module -ListAvailable -Name $module)) {
+            Write-Host " Module '$module' is missing, please install it with PS command 'Install-Module $module -Force'"
+            $ok = $false
+        }
+    }
+
+    if (-not $ok) {
+        Exit
+    }
+}
+
+# Check if logged in into Azure
+function CheckLogin() {
+    if ((Get-AzContext).Account.Id -eq $null) {
+        Write-Host " Please login in Azure with the 'Connect-AzAccount' command."
+        Exit
+    }
+}
+
 # Initialization
 function Init() {
     Write-Host "Initializing..."
     $global:listLocations = Get-AzLocation
     $global:top = $Top
+
+    CheckModulesInstalled
 
     if ($Interval -ne $null)  {
         $global:Interval = [TimeSpan]"00:00:00"
@@ -189,6 +216,7 @@ function Init() {
     # Convert file name to full path, if needed
     try {
         $xlFile=Get-Item -Path $Path -ErrorAction Stop
+        $ErrorActionPreference = "Continue"
     }
     catch {
         $xlFile = [regex]::Match($_, "\'(.*?)\'")[0].Value.Trim("'")
@@ -198,12 +226,16 @@ function Init() {
     if (-not $Continue) {
         "$(Get-Date)" | Set-Content -Path $logFile
         if (Test-Path $xlFile) {
-            Remove-Item $xlFile
+            Remove-Item $xlFile -ErrorAction "SilentlyContinue"
+            if (-not $?) {
+                Write-Host "Cannot open output file '$xlFile'. Check if it is already open by Excel."
+                Exit
+            }
         }
     }
 
     # Excel initialization
-    $global:exPkg = ExcelInit $xlFile
+    $global:exPkg = ExcelInit $xlFile -ErrorAction SilentlyContinue
     $global:workBook = ExcelNew-WorkBook $global:exPkg
 }
 
@@ -220,17 +252,17 @@ function UnattachedDisks() {
         ExcelAdd-WorkSheetRaw $workSheet $titleDisks
     }
 
-    Write-Host "`nProcessing unattached disks..."
+    Write-Host "`n`nProcessing unattached disks..." -NoNewLine
 
     foreach ($subs in $global:listSubscriptions) {
-        Write-Host "Subscription $($subs.Name)"
+        Write-Host "`n  $($subs.Name) - reading..." -NoNewLine
         $Null = Set-AzContext -Subscription $subs
 
         $listDisks = (Get-AzDisk | where DiskState -eq "Unattached")
         for ($i = 0; $i -lt $listDisks.Count; $i++) {
             $disk = $listDisks[$i]
 
-            Write-Host "`rDisks remaining: $($listDisks.Count - $i) " $disk.Name "                            " -NoNewLine
+            Write-Host "`r  $($subs.Name) Disk ($($i+1))/$($listDisks.Count) $($disk.Name)                            " -NoNewLine
 
             # Check if this is ASR replica disk
             if ($disk.Name.EndsWith("-ASRReplica") -or $disk.Name.StartsWith("asr")) {
@@ -279,17 +311,17 @@ function StorageAccounts() {
         ExcelAdd-WorkSheetRaw $workSheet $titleStorages
     }
 
-    Write-Host "`nProcessing Storage accounts..."
+    Write-Host "`n`nProcessing Storage accounts..." -NoNewLine
 
     foreach ($subs in $global:listSubscriptions) {
-        Write-Host "Subscription $($subs.Name)"
+        Write-Host "`n  $($subs.Name) - reading..." -NoNewLine
         $Null = Set-AzContext -Subscription $subs
     
         $listStorages = Get-AzStorageAccount
         for ($i = 0; $i -lt $listStorages.Count; $i++) {
             $storage = $listStorages[$i]
 
-            Write-Host "`rStorage Accounts remaining: $($listStorages.Count - $i) " $disk.Name "                            " -NoNewLine
+            Write-Host "`r  $($subs.Name) Storage Account ($($i+1))/$($listStorages.Count) $($storage.Name)                            " -NoNewLine
 
             # Check if continue after interruption
             if (CheckLog $storage.Id) {
@@ -340,17 +372,17 @@ function VMs() {
         ExcelAdd-WorkSheetRaw $workSheet $titleVMs
     }
 
-    Write-Host "`nProcessing VMs ..."
+    Write-Host "`n`nProcessing VMs ..." -NoNewLine
 
     foreach ($subs in $global:listSubscriptions) {
-        Write-Host "Subscription $($subs.Name)"
+        Write-Host "`n  $($subs.Name) - reading..." -NoNewLine
         $Null = Set-AzContext -Subscription $subs
 
         $listVMs = Get-AzVM
         $n = $listVMs.Count
         for ($i = 0; $i -lt $n; $i++) {
             $vm = $listVMs[$i]
-            Write-Host "`r  $subs - VM ($($i+1)/$n): " $vm.Name "                            " -NoNewLine
+            Write-Host "`r  $subs - VM ($($i+1)/$n) $($vm.Name)                           " -NoNewLine
 
             # Check if continue after interruption
             if (CheckLog $vm.Id) {
@@ -438,10 +470,10 @@ function UnattachedIPs() {
         ExcelAdd-WorkSheetRaw $workSheet $titleIPs
     }
 
-    Write-Host "`nProcessing IP addresses..."
+    Write-Host "`n`nProcessing Unattached IP addresses..." -NoNewLine
 
     foreach ($subs in $global:listSubscriptions) {
-        Write-Host "Subscription $($subs.Name)"
+        Write-Host "`n  $($subs.Name) - reading..." -NoNewLine
         $Null = Set-AzContext -Subscription $subs
 
         # Find all IPs without IP configuration associated with it
@@ -449,7 +481,7 @@ function UnattachedIPs() {
         for ($i = 0; $i -lt $listIPs.Count; $i++) {
             $ip = $listIPs[$i]
 
-            Write-Host "`rUnattached IPs remaining: $($listIPs.Count - $i) " $ip.Name "                            " -NoNewLine
+            Write-Host "`r  $($subs.Name) IP ($($i+1))/$($listIPs.Count) $($ip.Name)                            " -NoNewLine
 
             # Check if continue after interruption
             if (CheckLog $ip.Id) {
@@ -471,8 +503,6 @@ function UnattachedIPs() {
             }
             UpdateLog $ip.Id
         }
-
-        Write-Host ""
 
         # Find all IPs assigned to unattached Network Interface
         $listNets = Get-AzNetworkInterface | where { $_.VirtualMachine -eq $null -and $_.PublicIpAddress -ne $null }
