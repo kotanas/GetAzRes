@@ -15,7 +15,7 @@ Function ExcelInit([string]$Path) {
     return $exPkg
 }
 
-Function Close($exPkg) {
+Function ExcelClose($exPkg) {
     if ($exPkg -ne $null) {
         $exPkg.Close()
     }
@@ -157,4 +157,5 @@ Function ExcelAdd-WorkSheetRaw($workSheet, [string[]]$listParams) {
 	}
 
 	$WorkSheetXmlDoc.Save($workSheet.GetStream([System.IO.FileMode]::Open,[System.IO.FileAccess]::Write))
+    $global:exPkg.Flush()
 }
